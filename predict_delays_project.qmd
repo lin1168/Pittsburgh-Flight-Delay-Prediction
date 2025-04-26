@@ -1,0 +1,1190 @@
+---
+title: "predict_delays_project"
+format: html
+---
+
+# Load packages and datasets
+
+``` {r, warning = FALSE}
+# Loading necessary packages
+library(dplyr)
+library(randomForest)
+library(airportr)
+library(lubridate)
+library(pROC)
+library(ggplot2)
+library(caret)
+```
+
+``` {r}
+# Loading 2022 and 2023 flight data
+flights_2022 <- read.csv("flights2022.csv")
+flights_2023 <- read.csv("flights2023.csv")
+
+pre_2024_flights <- rbind(flights_2022, flights_2023)
+  
+flights_2024 <- read.csv("flights2024.csv")
+flights_2024_visible <- read.csv("flights2024_visible.csv")
+flights_2024_guess <- read.csv("flights2024_guess.csv")
+```
+
+# EDA
+
+``` {r}
+# filter by delayed flights
+# departing_2022_delays <- departing_2022 |>
+#   filter(DEP_DEL15 == 1)
+# departing_2023_delays <- departing_2023 |>
+#   filter(DEP_DEL15 == 1)
+
+# filter by not delayed flights
+# departing_2022_nondelays <- departing_2022 |>
+#   filter(DEP_DEL15 == 0)
+# departing_2023_nondelays <- departing_2023 |>
+#   filter(DEP_DEL15 == 0)
+
+# Create dataframes of just arriving flights to PIT
+# arriving_2022 <- flights_2022 |>
+#   filter(DEST == "PIT")
+# arriving_2023 <- flights_2023 |>
+#   filter(DEST == "PIT")
+```
+
+``` {r}
+# par(mfrow = c(1, 2))
+# hist(departing_2022$DEP_DEL15)
+# hist(departing_2023$DEP_DEL15)
+```
+## Comparing Features of Interest to Target Variable
+
+``` {r}
+# hist(departing_2022_delays$MONTH)
+# hist(departing_2022_delays$DAY_OF_MONTH)
+# hist(departing_2022_delays$DAY_OF_WEEK)
+#   
+# barplot(table(departing_2022_delays$OP_UNIQUE_CARRIER))
+# barplot(table(departing_2022_nondelays$OP_UNIQUE_CARRIER))
+```
+
+``` {r}
+# cor(train_departing_2022_not_cancelled$CRS_ARR_TIME,
+#     train_departing_2022_not_cancelled$DEP_DEL15)
+# plot(train_departing_2022_not_cancelled$CRS_ARR_TIME, 
+#      train_departing_2022_not_cancelled$DEP_DEL15)
+```
+
+# Preprocessing
+
+## Convert `DAY_OF_MONTH`, `MONTH`, and `DAY_OF_WEEK` to cyclical features
+
+``` {r}
+pre_2024_flights <- pre_2024_flights %>%
+  mutate(
+    month_sin = sin(2 * pi * MONTH / 12),
+    month_cos = cos(2 * pi * MONTH / 12),
+    
+    # Day of month (approximating to 30-day cycle)
+    dom_sin = sin(2 * pi * DAY_OF_MONTH / 31),
+    dom_cos = cos(2 * pi * DAY_OF_MONTH / 31),
+    
+    # Day of week
+    dow_sin = sin(2 * pi * DAY_OF_WEEK / 7),
+    dow_cos = cos(2 * pi * DAY_OF_WEEK / 7)
+  )
+
+flights_2024 <- flights_2024 %>%
+  mutate(
+    month_sin = sin(2 * pi * MONTH / 12),
+    month_cos = cos(2 * pi * MONTH / 12),
+    
+    # Day of month (approximating to 30-day cycle)
+    dom_sin = sin(2 * pi * DAY_OF_MONTH / 31),
+    dom_cos = cos(2 * pi * DAY_OF_MONTH / 31),
+    
+    # Day of week
+    dow_sin = sin(2 * pi * DAY_OF_WEEK / 7),
+    dow_cos = cos(2 * pi * DAY_OF_WEEK / 7)
+  )
+
+flights_2024_visible <- flights_2024_visible %>%
+  mutate(
+    month_sin = sin(2 * pi * MONTH / 12),
+    month_cos = cos(2 * pi * MONTH / 12),
+    
+    # Day of month (approximating to 30-day cycle)
+    dom_sin = sin(2 * pi * DAY_OF_MONTH / 31),
+    dom_cos = cos(2 * pi * DAY_OF_MONTH / 31),
+    
+    # Day of week
+    dow_sin = sin(2 * pi * DAY_OF_WEEK / 7),
+    dow_cos = cos(2 * pi * DAY_OF_WEEK / 7)
+  )
+
+flights_2024_guess <- flights_2024_guess %>%
+  mutate(
+    month_sin = sin(2 * pi * MONTH / 12),
+    month_cos = cos(2 * pi * MONTH / 12),
+    
+    # Day of month (approximating to 30-day cycle)
+    dom_sin = sin(2 * pi * DAY_OF_MONTH / 31),
+    dom_cos = cos(2 * pi * DAY_OF_MONTH / 31),
+    
+    # Day of week
+    dow_sin = sin(2 * pi * DAY_OF_WEEK / 7),
+    dow_cos = cos(2 * pi * DAY_OF_WEEK / 7)
+  )
+```
+
+## Add feature about whether last flight was delayed
+
+``` {r}
+airport_timezone_map <- airports |>
+  dplyr::select(IATA, Timezone) |>
+  filter(!is.na(IATA), !is.na(Timezone)) |>
+  distinct()
+
+airport_timezones <- setNames(
+  airport_timezone_map$Timezone,
+  airport_timezone_map$IATA
+)
+
+convert_dep_time_fixed <- function(date_str, time_hhmm, origin) {
+  # Add error checking
+  if (is.na(date_str) || is.na(time_hhmm) || is.na(origin)) {
+    return(NA)
+  }
+  
+  # Check if origin exists in airport_timezones
+  tz <- airport_timezones[origin]
+  if (is.null(tz) || length(tz) == 0 || is.na(tz)) {
+    return(NA)
+  }
+  
+  # Clean up the date string and try to determine format
+  date_part <- sub(" .*$", "", date_str)
+  
+  # Format the time properly
+  time_fmt <- sprintf("%04d", as.numeric(time_hhmm))
+  
+  # Try multiple date formats
+  datetime_str <- paste(date_part, time_fmt)
+  
+  # Try mm/dd/YYYY format first
+  dt <- try(as.POSIXct(datetime_str, format = "%m/%d/%Y %H%M", tz = tz), silent = TRUE)
+  
+  # If that fails, try YYYY-mm-dd format
+  if (inherits(dt, "try-error") || is.na(dt)) {
+    dt <- try(as.POSIXct(datetime_str, format = "%Y-%m-%d %H%M", tz = tz), silent = TRUE)
+  }
+  
+  # If both fail, try to determine format dynamically
+  if (inherits(dt, "try-error") || is.na(dt)) {
+    if (grepl("^[0-9]{1,2}/[0-9]{1,2}/[0-9]{4}$", date_part)) {
+      dt <- try(as.POSIXct(datetime_str, format = "%m/%d/%Y %H%M", tz = tz), silent = TRUE)
+    } else if (grepl("^[0-9]{4}-[0-9]{1,2}-[0-9]{1,2}$", date_part)) {
+      dt <- try(as.POSIXct(datetime_str, format = "%Y-%m-%d %H%M", tz = tz), silent = TRUE)
+    }
+  }
+  
+  if (inherits(dt, "try-error") || is.na(dt)) {
+    return(NA)
+  }
+  
+  # Convert to Pittsburgh time (America/New_York)
+  pit_dt <- with_tz(dt, "America/New_York")
+  
+  return(as.numeric(format(pit_dt, "%H%M")))
+}
+
+# Apply the function to each row
+pre_2024_flights <- pre_2024_flights %>%
+  mutate(
+    CRS_DEP_TIME_PIT = mapply(
+      convert_dep_time_fixed,
+      FL_DATE,
+      CRS_DEP_TIME,
+      ORIGIN
+    )
+  ) |>
+  relocate(CRS_DEP_TIME_PIT, .after = CRS_DEP_TIME)
+  
+
+flights_2024 <- flights_2024 |>
+  mutate(
+    CRS_DEP_TIME_PIT = mapply(
+      convert_dep_time_fixed,
+      FL_DATE,
+      CRS_DEP_TIME,
+      ORIGIN
+    )
+  ) |>
+  relocate(CRS_DEP_TIME_PIT, .after = CRS_DEP_TIME)
+
+flights_2024_guess <- flights_2024_guess |>
+  mutate(
+    CRS_DEP_TIME_PIT = mapply(
+      convert_dep_time_fixed,
+      FL_DATE,
+      CRS_DEP_TIME,
+      ORIGIN
+    )
+  ) |>
+  relocate(CRS_DEP_TIME_PIT, .after = CRS_DEP_TIME)
+
+flights_2024_visible <- flights_2024_visible |>
+  mutate(
+    CRS_DEP_TIME_PIT = mapply(
+      convert_dep_time_fixed,
+      FL_DATE,
+      CRS_DEP_TIME,
+      ORIGIN
+    )
+  ) |>
+  relocate(CRS_DEP_TIME_PIT, .after = CRS_DEP_TIME)
+```
+
+Now, need to do lagged window of 1 and see if the previous leg for the SAME Tail Number was also delayed
+``` {r}
+# Sort by TAIL_NUM and Pittsburgh-referenced time
+# flights_2022 <- flights_2022 %>%
+#   arrange(TAIL_NUM, FL_DATE, CRS_DEP_TIME_PIT)
+# 
+# flights_2024_visible <- flights_2024_visible %>%
+#   arrange(TAIL_NUM, FL_DATE, CRS_DEP_TIME_PIT)
+# 
+# flights_2024_visible_relevant <- flights_2024_visible |>
+#   dplyr::select(c(FL_DATE, TAIL_NUM, ORIGIN, DEST, CRS_DEP_TIME_PIT, DEP_TIME, DEP_DELAY, DEP_DEL15)) |>
+#   arrange(TAIL_NUM, FL_DATE, CRS_DEP_TIME_PIT)
+# 
+# temp <- flights_2024_visible_relevant |>
+#   filter(is.na(DEP_TIME)) |>
+#   dplyr::select(TAIL_NUM)
+# 
+# tail_num_frequencies <- temp %>%
+#   count(TAIL_NUM, name = "missing_count") %>%
+#   count(missing_count, name = "num_aircraft") 
+# 
+# barplot(tail_num_frequencies$num_aircraft, 
+#         names.arg = tail_num_frequencies$missing_count,
+#         main = "Distribution of Missing Departure Times per Aircraft",
+#         xlab = "Number of Missing DEP_TIME per Aircraft",
+#         ylab = "Count of Aircraft")
+# 
+# write.csv(flights_2022, file = "create_feature.csv")
+
+```
+
+``` {r}
+pre_2024_flights <- pre_2024_flights %>%
+  # Group by date and tail number
+  group_by(FL_DATE, TAIL_NUM) %>%
+  # Arrange by departure time
+  arrange(FL_DATE, TAIL_NUM, CRS_DEP_TIME_PIT) %>%
+  # Create the previous leg delay feature
+  mutate(
+    # Get the delay status of the previous leg
+    PREV_LEG_DELAYED = lag(DEP_DEL15, 1),
+    # PREV_LEG_DELAYED = lag(ifelse(DEP_DELAY > 0, 1, 0), 1),
+    
+    # Handle the first flight of the day (no previous leg)
+    PREV_LEG_DELAYED = if_else(is.na(PREV_LEG_DELAYED), 0, PREV_LEG_DELAYED)
+  ) %>%
+  ungroup() |>
+  relocate(PREV_LEG_DELAYED, .after = DEP_DEL15) %>%
+  arrange(TAIL_NUM, FL_DATE, CRS_DEP_TIME_PIT)
+
+flights_2024 <- flights_2024 %>%
+  # Group by date and tail number
+  group_by(FL_DATE, TAIL_NUM) %>%
+  # Arrange by departure time
+  arrange(FL_DATE, TAIL_NUM, CRS_DEP_TIME_PIT) %>%
+  # Create the previous leg delay feature
+  mutate(
+    # Get the delay status of the previous leg
+    PREV_LEG_DELAYED = lag(DEP_DEL15, 1),
+    # PREV_LEG_DELAYED = lag(ifelse(DEP_DELAY > 0, 1, 0), 1),
+    
+    # Handle the first flight of the day (no previous leg)
+    PREV_LEG_DELAYED = if_else(is.na(PREV_LEG_DELAYED), 0, PREV_LEG_DELAYED)
+  ) %>%
+  ungroup() |>
+  relocate(PREV_LEG_DELAYED, .after = DEP_DEL15) %>%
+  arrange(TAIL_NUM, FL_DATE, CRS_DEP_TIME_PIT)
+
+flights_2024_guess <- flights_2024_guess %>%
+  left_join(
+    flights_2024 %>%
+      dplyr::select(TAIL_NUM, FL_DATE, CRS_DEP_TIME_PIT, PREV_LEG_DELAYED),  # Selecting the relevant columns
+    by = c("TAIL_NUM", "FL_DATE", "CRS_DEP_TIME_PIT")  # Merge based on all three columns
+  ) |>
+  relocate(PREV_LEG_DELAYED, .after = DEP_DEL15)
+
+flights_2024_visible <- flights_2024_visible %>%
+  # Group by date and tail number
+  group_by(FL_DATE, TAIL_NUM) %>%
+  # Arrange by departure time
+  arrange(FL_DATE, TAIL_NUM, CRS_DEP_TIME_PIT) %>%
+  # Create the previous leg delay feature
+  mutate(
+    # Get the delay status of the previous leg
+    PREV_LEG_DELAYED = lag(DEP_DEL15, 1),
+    # PREV_LEG_DELAYED = lag(ifelse(DEP_DELAY > 0, 1, 0), 1),
+    
+    # Handle the first flight of the day (no previous leg)
+    PREV_LEG_DELAYED = if_else(is.na(PREV_LEG_DELAYED), 0, PREV_LEG_DELAYED)
+  ) %>%
+  ungroup() |>
+  relocate(PREV_LEG_DELAYED, .after = DEP_DEL15) %>%
+  arrange(TAIL_NUM, FL_DATE, CRS_DEP_TIME_PIT)
+```
+
+``` {r}
+# available columns only
+pre_2024_flights <- pre_2024_flights |>
+  dplyr::filter(CANCELLED != 1) |>
+  dplyr::filter(ORIGIN == "PIT") |>
+  dplyr::select(-c(DEP_TIME, DEP_DELAY, DEP_DELAY_NEW, DEP_DELAY_GROUP,
+  DEP_TIME_BLK, TAXI_OUT, WHEELS_OFF, WHEELS_ON, TAXI_IN, ARR_TIME,
+  ARR_DELAY, ARR_DELAY_NEW, ARR_DEL15, ARR_DELAY_GROUP, ARR_TIME_BLK,
+  CANCELLED, CANCELLATION_CODE, DIVERTED, ACTUAL_ELAPSED_TIME, AIR_TIME,
+  CARRIER_DELAY, WEATHER_DELAY, NAS_DELAY, SECURITY_DELAY,
+  LATE_AIRCRAFT_DELAY, FIRST_DEP_TIME, TOTAL_ADD_GTIME, LONGEST_ADD_GTIME))
+
+flights_2024 <- flights_2024 |>
+  # dplyr::filter(CANCELLED != 1) |>
+  dplyr::filter(ORIGIN == "PIT") |>
+  dplyr::select(-c(DEP_TIME, DEP_DELAY, DEP_DELAY_NEW, DEP_DELAY_GROUP,
+  DEP_TIME_BLK, TAXI_OUT, WHEELS_OFF, WHEELS_ON, TAXI_IN, ARR_TIME,
+  ARR_DELAY, ARR_DELAY_NEW, ARR_DEL15, ARR_DELAY_GROUP, ARR_TIME_BLK,
+  CANCELLED, CANCELLATION_CODE, DIVERTED, ACTUAL_ELAPSED_TIME, AIR_TIME,
+  CARRIER_DELAY, WEATHER_DELAY, NAS_DELAY, SECURITY_DELAY,
+  LATE_AIRCRAFT_DELAY, FIRST_DEP_TIME, TOTAL_ADD_GTIME, LONGEST_ADD_GTIME))
+
+flights_2024_guess <- flights_2024_guess |>
+  # dplyr::filter(CANCELLED != 1) |>
+  dplyr::filter(ORIGIN == "PIT") |>
+  dplyr::select(-c(DEP_TIME, DEP_DELAY, DEP_DELAY_NEW, DEP_DELAY_GROUP,
+  DEP_TIME_BLK, TAXI_OUT, WHEELS_OFF, WHEELS_ON, TAXI_IN, ARR_TIME,
+  ARR_DELAY, ARR_DELAY_NEW, ARR_DEL15, ARR_DELAY_GROUP, ARR_TIME_BLK,
+  CANCELLED, CANCELLATION_CODE, DIVERTED, ACTUAL_ELAPSED_TIME, AIR_TIME,
+  CARRIER_DELAY, WEATHER_DELAY, NAS_DELAY, SECURITY_DELAY,
+  LATE_AIRCRAFT_DELAY, FIRST_DEP_TIME, TOTAL_ADD_GTIME, LONGEST_ADD_GTIME))
+
+flights_2024_visible <- flights_2024_visible |>
+  # dplyr::filter(CANCELLED != 1) |>
+  dplyr::filter(ORIGIN == "PIT") |>
+  dplyr::select(-c(DEP_TIME, DEP_DELAY, DEP_DELAY_NEW, DEP_DELAY_GROUP,
+  DEP_TIME_BLK, TAXI_OUT, WHEELS_OFF, WHEELS_ON, TAXI_IN, ARR_TIME,
+  ARR_DELAY, ARR_DELAY_NEW, ARR_DEL15, ARR_DELAY_GROUP, ARR_TIME_BLK,
+  CANCELLED, CANCELLATION_CODE, DIVERTED, ACTUAL_ELAPSED_TIME, AIR_TIME,
+  CARRIER_DELAY, WEATHER_DELAY, NAS_DELAY, SECURITY_DELAY,
+  LATE_AIRCRAFT_DELAY, FIRST_DEP_TIME, TOTAL_ADD_GTIME, LONGEST_ADD_GTIME))
+```
+
+# Testing on Allegiant Air Tail Num 253NV
+
+``` {r}
+# g4_253nv <- flights_2022 |>
+#   mutate(FL_DATE = as.Date(FL_DATE, format = "%m/%d/%Y %I:%M:%S %p")) |>
+#   filter(TAIL_NUM == '253NV') |>
+#   arrange(FL_DATE, CRS_DEP_TIME_PIT)
+# 
+# g4_253nv_2024 <- flights_2024 |>
+#   mutate(FL_DATE = as.Date(FL_DATE, format = "%m/%d/%Y %I:%M:%S %p")) |>
+#   filter(TAIL_NUM == '253NV') |>
+#   arrange(FL_DATE, CRS_DEP_TIME_PIT)
+```
+
+# Model Building
+
+## Baseline Model (Random Forest)
+
+### Convert hhmm to time bins
+``` {r}
+# pre-processing to convert hhmm columns to time bins
+convert_time_to_factor <- function(time_hhmm) {
+  # Convert to minutes since midnight
+  time_minutes <- (as.numeric(time_hhmm) %/% 100) * 60 + (as.numeric(time_hhmm) %% 100)
+  
+  # Create factor with time periods
+  time_factor <- cut(
+    time_minutes,
+    breaks = c(0, 6*60, 9*60, 12*60, 15*60, 18*60, 21*60, 24*60),
+    labels = c("early_morning", "morning_rush", "midday", 
+               "afternoon", "evening_rush", "evening", "night"),
+    include.lowest = TRUE
+  )
+  
+  return(time_factor)
+}
+
+time_columns <- c("CRS_DEP_TIME", "CRS_ARR_TIME", "CRS_DEP_TIME_PIT")
+
+for (col in time_columns) {
+  pre_2024_flights[[col]] <- convert_time_to_factor(pre_2024_flights[[col]])
+}
+
+for (col in time_columns) {
+  flights_2024[[col]] <- convert_time_to_factor(flights_2024[[col]])
+}
+
+for (col in time_columns) {
+  flights_2024_guess[[col]] <- convert_time_to_factor(flights_2024_guess[[col]])
+}
+
+for (col in time_columns) {
+  flights_2024_visible[[col]] <- convert_time_to_factor(flights_2024_visible[[col]])
+}
+```
+
+# interaction term between departure time and prev leg delayed
+``` {r}
+pre_2024_flights <- pre_2024_flights %>%
+  mutate(
+    # Create dummy variables for all levels of CRS_DEP_TIME
+    CRS_DEP_TIME_early_morning = ifelse(CRS_DEP_TIME == "early_morning", 1, 0),
+    CRS_DEP_TIME_morning_rush = ifelse(CRS_DEP_TIME == "morning_rush", 1, 0),
+    CRS_DEP_TIME_midday = ifelse(CRS_DEP_TIME == "midday", 1, 0),
+    CRS_DEP_TIME_afternoon = ifelse(CRS_DEP_TIME == "afternoon", 1, 0),
+    CRS_DEP_TIME_evening_rush = ifelse(CRS_DEP_TIME == "evening_rush", 1, 0),
+    CRS_DEP_TIME_evening = ifelse(CRS_DEP_TIME == "evening", 1, 0),
+    CRS_DEP_TIME_night = ifelse(CRS_DEP_TIME == "night", 1, 0),
+    
+    # Create interaction terms between each time category and PREV_LEG_DELAYED
+    early_morning_prev_delayed = CRS_DEP_TIME_early_morning * PREV_LEG_DELAYED,
+    morning_rush_prev_delayed = CRS_DEP_TIME_morning_rush * PREV_LEG_DELAYED,
+    midday_prev_delayed = CRS_DEP_TIME_midday * PREV_LEG_DELAYED,
+    afternoon_prev_delayed = CRS_DEP_TIME_afternoon * PREV_LEG_DELAYED,
+    evening_rush_prev_delayed = CRS_DEP_TIME_evening_rush * PREV_LEG_DELAYED,
+    evening_prev_delayed = CRS_DEP_TIME_evening * PREV_LEG_DELAYED,
+    night_prev_delayed = CRS_DEP_TIME_night * PREV_LEG_DELAYED
+  )
+
+flights_2024_visible <- flights_2024_visible %>%
+  mutate(
+    # Create dummy variables for all levels of CRS_DEP_TIME
+    CRS_DEP_TIME_early_morning = ifelse(CRS_DEP_TIME == "early_morning", 1, 0),
+    CRS_DEP_TIME_morning_rush = ifelse(CRS_DEP_TIME == "morning_rush", 1, 0),
+    CRS_DEP_TIME_midday = ifelse(CRS_DEP_TIME == "midday", 1, 0),
+    CRS_DEP_TIME_afternoon = ifelse(CRS_DEP_TIME == "afternoon", 1, 0),
+    CRS_DEP_TIME_evening_rush = ifelse(CRS_DEP_TIME == "evening_rush", 1, 0),
+    CRS_DEP_TIME_evening = ifelse(CRS_DEP_TIME == "evening", 1, 0),
+    CRS_DEP_TIME_night = ifelse(CRS_DEP_TIME == "night", 1, 0),
+    
+    # Create interaction terms between each time category and PREV_LEG_DELAYED
+    early_morning_prev_delayed = CRS_DEP_TIME_early_morning * PREV_LEG_DELAYED,
+    morning_rush_prev_delayed = CRS_DEP_TIME_morning_rush * PREV_LEG_DELAYED,
+    midday_prev_delayed = CRS_DEP_TIME_midday * PREV_LEG_DELAYED,
+    afternoon_prev_delayed = CRS_DEP_TIME_afternoon * PREV_LEG_DELAYED,
+    evening_rush_prev_delayed = CRS_DEP_TIME_evening_rush * PREV_LEG_DELAYED,
+    evening_prev_delayed = CRS_DEP_TIME_evening * PREV_LEG_DELAYED,
+    night_prev_delayed = CRS_DEP_TIME_night * PREV_LEG_DELAYED
+  )
+
+flights_2024 <- flights_2024 %>%
+  mutate(
+    # Create dummy variables for all levels of CRS_DEP_TIME
+    CRS_DEP_TIME_early_morning = ifelse(CRS_DEP_TIME == "early_morning", 1, 0),
+    CRS_DEP_TIME_morning_rush = ifelse(CRS_DEP_TIME == "morning_rush", 1, 0),
+    CRS_DEP_TIME_midday = ifelse(CRS_DEP_TIME == "midday", 1, 0),
+    CRS_DEP_TIME_afternoon = ifelse(CRS_DEP_TIME == "afternoon", 1, 0),
+    CRS_DEP_TIME_evening_rush = ifelse(CRS_DEP_TIME == "evening_rush", 1, 0),
+    CRS_DEP_TIME_evening = ifelse(CRS_DEP_TIME == "evening", 1, 0),
+    CRS_DEP_TIME_night = ifelse(CRS_DEP_TIME == "night", 1, 0),
+    
+    # Create interaction terms between each time category and PREV_LEG_DELAYED
+    early_morning_prev_delayed = CRS_DEP_TIME_early_morning * PREV_LEG_DELAYED,
+    morning_rush_prev_delayed = CRS_DEP_TIME_morning_rush * PREV_LEG_DELAYED,
+    midday_prev_delayed = CRS_DEP_TIME_midday * PREV_LEG_DELAYED,
+    afternoon_prev_delayed = CRS_DEP_TIME_afternoon * PREV_LEG_DELAYED,
+    evening_rush_prev_delayed = CRS_DEP_TIME_evening_rush * PREV_LEG_DELAYED,
+    evening_prev_delayed = CRS_DEP_TIME_evening * PREV_LEG_DELAYED,
+    night_prev_delayed = CRS_DEP_TIME_night * PREV_LEG_DELAYED
+  )
+
+flights_2024_guess <- flights_2024_guess %>%
+  mutate(
+    # Create dummy variables for all levels of CRS_DEP_TIME
+    CRS_DEP_TIME_early_morning = ifelse(CRS_DEP_TIME == "early_morning", 1, 0),
+    CRS_DEP_TIME_morning_rush = ifelse(CRS_DEP_TIME == "morning_rush", 1, 0),
+    CRS_DEP_TIME_midday = ifelse(CRS_DEP_TIME == "midday", 1, 0),
+    CRS_DEP_TIME_afternoon = ifelse(CRS_DEP_TIME == "afternoon", 1, 0),
+    CRS_DEP_TIME_evening_rush = ifelse(CRS_DEP_TIME == "evening_rush", 1, 0),
+    CRS_DEP_TIME_evening = ifelse(CRS_DEP_TIME == "evening", 1, 0),
+    CRS_DEP_TIME_night = ifelse(CRS_DEP_TIME == "night", 1, 0),
+    
+    # Create interaction terms between each time category and PREV_LEG_DELAYED
+    early_morning_prev_delayed = CRS_DEP_TIME_early_morning * PREV_LEG_DELAYED,
+    morning_rush_prev_delayed = CRS_DEP_TIME_morning_rush * PREV_LEG_DELAYED,
+    midday_prev_delayed = CRS_DEP_TIME_midday * PREV_LEG_DELAYED,
+    afternoon_prev_delayed = CRS_DEP_TIME_afternoon * PREV_LEG_DELAYED,
+    evening_rush_prev_delayed = CRS_DEP_TIME_evening_rush * PREV_LEG_DELAYED,
+    evening_prev_delayed = CRS_DEP_TIME_evening * PREV_LEG_DELAYED,
+    night_prev_delayed = CRS_DEP_TIME_night * PREV_LEG_DELAYED
+  )
+```
+
+# Random Forest to figure out informative weather features
+``` {r}
+library(readr)
+weather1 <- read_csv("pittsburgh 2022-01-01 to 2024-08-31.csv")
+weather2 <- read_csv("pittsburgh 2024-09-01 to 2024-12-31.csv")
+```
+
+``` {r}
+weather_all <- bind_rows(weather1, weather2) %>%
+  mutate(
+    date = as.Date(datetime),  # Create clean date column for merging
+    is_rain = ifelse(precip > 0, 1, 0),
+    is_snow = ifelse(snowdepth > 0 | conditions %in% c("Snow", "Snow, Overcast"), 1, 0)
+  ) |>
+  dplyr::select(-c(name, preciptype, severerisk, sunrise, sunset, conditions, description, icon, stations))
+  # dplyr::select(
+  #   date,
+  #   tempmax, tempmin, temp,
+  #   precip, snow, snowdepth,
+  #   windspeed, cloudcover,
+  #   conditions,
+  #   is_rain, is_snow
+  # )
+
+# Convert FL_DATE in pre_2024_flights to Date format (YYYY-MM-DD)
+pre_2024_flights$FL_DATE <- as.Date(pre_2024_flights$FL_DATE, format = "%m/%d/%Y %I:%M:%S %p")
+
+# Ensure date in weather_all is in Date format (YYYY-MM-DD)
+weather_all$date <- as.Date(weather_all$date, format = "%Y-%m-%d")
+
+to_fit <- left_join(pre_2024_flights, weather_all, by = c("FL_DATE" = "date"))
+to_fit_X <- to_fit |>
+  dplyr::select(-c(DEP_DEL15))
+to_fit_y <- to_fit |>
+  dplyr::select(DEP_DEL15) |>
+  pull()
+```
+
+``` {r}
+test.rf <- randomForest(to_fit_X, y = factor(to_fit_y), classwt = c(1, 5))
+
+weather_model_importance <- importance(test.rf) |>
+  as.data.frame() |>
+  arrange(desc(MeanDecreaseGini))
+weather_model_importance
+```
+
+## Incorporate chosen weather features..
+
+``` {r}
+weather_select <- bind_rows(weather1, weather2) %>%
+  mutate(
+    date = as.Date(datetime)
+  ) |>
+  dplyr::select(date, 
+    winddir, humidity,
+    sealevelpressure, windspeed,
+    cloudcover, windgust
+  )
+
+# Convert FL_DATE in pre_2024_flights to Date format (YYYY-MM-DD)
+pre_2024_flights$FL_DATE <- as.Date(pre_2024_flights$FL_DATE, format = "%m/%d/%Y %I:%M:%S %p")
+flights_2024$FL_DATE <- as.Date(flights_2024$FL_DATE, format = "%m/%d/%Y %I:%M:%S %p")
+flights_2024_guess$FL_DATE <- as.Date(flights_2024_guess$FL_DATE, format = "%m/%d/%Y %I:%M:%S %p")
+flights_2024_visible$FL_DATE <- as.Date(flights_2024_visible$FL_DATE, format = "%m/%d/%Y %I:%M:%S %p")
+
+# Ensure date in weather_all is in Date format (YYYY-MM-DD)
+weather_select$date <- as.Date(weather_select$date, format = "%Y-%m-%d")
+
+pre_2024_flights <- left_join(pre_2024_flights, weather_select, by = c("FL_DATE" = "date"))
+flights_2024 <- left_join(flights_2024, weather_select, by = c("FL_DATE" = "date"))
+flights_2024_guess <- left_join(flights_2024_guess, weather_select, by = c("FL_DATE" = "date"))
+flights_2024_visible <- left_join(flights_2024_visible, weather_select, by = c("FL_DATE" = "date"))
+```
+
+``` {r}
+# weather_time_stats <- pre_2024_flights %>%
+#   group_by(CRS_DEP_TIME) %>%
+#   summarise(
+#     max_windgust = max(windgust, na.rm = TRUE),
+#     max_cloudcover = max(cloudcover, na.rm = TRUE),
+#     mean_windgust = mean(windgust, na.rm = TRUE),
+#     mean_cloudcover = mean(cloudcover, na.rm = TRUE)
+#   ) %>%
+#   arrange(desc(max_windgust))  # To see the highest windgust first
+# 
+# # Print the results
+# print(weather_time_stats)
+```
+
+``` {r}
+# split into train/validation sets 
+# set.seed(888)
+# sample <- sample(c(TRUE, FALSE), nrow(pre_2024_flights), replace = TRUE, 
+#                  prob = c(0.8, 0.2))
+# train_pre_2024 <- pre_2024_flights[sample, ]
+# validation_pre_2024 <- pre_2024_flights[!sample, ]
+
+# sample_2024 <- sample(c(TRUE, FALSE), nrow(flights_2024), replace = TRUE, 
+#                  prob = c(0.8, 0.2))
+# train_2024 <- flights_2024[sample_2024, ]
+# validation_2024 <- flights_2024[!sample_2024, ]
+```
+
+## LASSO
+
+``` {r}
+# # Ensure the target variable (DEP_DEL15) is a factor (binary classification)
+# pre_2024_flights$DEP_DEL15 <- factor(pre_2024_flights$DEP_DEL15, levels = c("0", "1"))
+# 
+# # Extract the predictor matrix (X) and the target variable (y)
+# temp <- pre_2024_flights |>
+#   # remove cols. with only 1 unique value
+#   dplyr::select(-c(YEAR, ORIGIN_AIRPORT_ID, ORIGIN_AIRPORT_SEQ_ID, ORIGIN_CITY_MARKET_ID,
+#             ORIGIN, ORIGIN_CITY_NAME, ORIGIN_STATE_ABR, ORIGIN_STATE_FIPS,
+#             ORIGIN_STATE_NM, ORIGIN_WAC, 
+#             FLIGHTS)) |>
+#   # remove cols. that are too granular
+#   dplyr::select(-c(FL_DATE, TAIL_NUM)) |>
+#   # remove "label" columns
+#   dplyr::select(-c(OP_CARRIER_FL_NUM))
+# lasso.X <- temp[, -which(names(temp) == "DEP_DEL15")]
+# lasso.y <- temp$DEP_DEL15
+# 
+# # If your predictors are factors, convert them to dummy variables (e.g., one-hot encoding)
+# lasso.X <- model.matrix(~ ., data = lasso.X)[, -1]  # Remove intercept column
+# 
+# # Standardize the predictor variables (this is crucial for LASSO)
+# X_scaled <- scale(lasso.X)
+# 
+# # Install and load glmnet package
+# install.packages("glmnet")
+# library(glmnet)
+# 
+# # Fit the LASSO model
+# lasso_model <- glmnet(X_scaled, lasso.y, family = "binomial", alpha = 1)
+# 
+# # Perform cross-validation to find the best lambda
+# cv_lasso <- cv.glmnet(X_scaled, lasso.y, family = "binomial", alpha = 1)
+# 
+# # Get the best lambda
+# best_lambda <- cv_lasso$lambda.min
+# 
+# # Refit the LASSO model using the best lambda
+# lasso_best <- glmnet(X_scaled, lasso.y, family = "binomial", alpha = 1, lambda = best_lambda)
+# 
+# # Get the coefficients for the best lambda
+# lasso_coeffs <- coef(lasso_best)
+# 
+# # Identify features selected by LASSO (non-zero coefficients)
+# selected_features <- rownames(lasso_coeffs)[lasso_coeffs[,1] != 0]
+# selected_features
+# 
+# unselected <- rownames(lasso_coeffs)[lasso_coeffs[,1] == 0]
+# unselected
+
+```
+
+``` {r}
+X <- pre_2024_flights |>
+  # remove target variable
+  dplyr::select(-c(DEP_DEL15)) |>
+  # remove cols. with only 1 unique value
+  dplyr::select(-c(YEAR, ORIGIN_AIRPORT_ID, ORIGIN_AIRPORT_SEQ_ID, ORIGIN_CITY_MARKET_ID,
+            ORIGIN, ORIGIN_CITY_NAME, ORIGIN_STATE_ABR, ORIGIN_STATE_FIPS,
+            ORIGIN_STATE_NM, ORIGIN_WAC, 
+            FLIGHTS)) |>
+  # remove cols. that are too granular
+  dplyr::select(-c(FL_DATE, TAIL_NUM)) |>
+  # remove "label" columns
+  dplyr::select(-c(OP_CARRIER_FL_NUM))
+  # remove features not selected by LASSO
+  # dplyr::select(-c(DAY_OF_MONTH, DEST_AIRPORT_SEQ_ID, DEST_AIRPORT_ID,
+  #                  DEST_CITY_MARKET_ID, DEST_STATE_FIPS, DEST_WAC, 
+  #                  CRS_ELAPSED_TIME))
+
+# test X
+new_X <- flights_2024_visible |>
+  # remove target variable
+  dplyr::select(-c(DEP_DEL15)) |>
+  # remove cols. with only 1 unique value
+  dplyr::select(-c(YEAR, ORIGIN_AIRPORT_ID, ORIGIN_AIRPORT_SEQ_ID, ORIGIN_CITY_MARKET_ID,
+            ORIGIN, ORIGIN_CITY_NAME, ORIGIN_STATE_ABR, ORIGIN_STATE_FIPS,
+            ORIGIN_STATE_NM, ORIGIN_WAC, 
+            FLIGHTS)) |>
+  # remove cols. that are too granular
+  dplyr::select(-c(FL_DATE, TAIL_NUM)) |>
+  # remove "label" columns
+  dplyr::select(-c(OP_CARRIER_FL_NUM))
+  # remove features not selected by LASSO
+  # dplyr::select(-c(DAY_OF_MONTH, DEST_AIRPORT_SEQ_ID, DEST_AIRPORT_ID,
+  #                  DEST_CITY_MARKET_ID, DEST_STATE_FIPS, DEST_WAC, 
+  #                  CRS_ELAPSED_TIME))
+
+# convert everything to a factor except CRS_ELAPSED_TIME and DISTANCE and others
+numeric_cols <- c("CRS_ELAPSED_TIME", "DISTANCE", 
+                  "winddir", "humidity", "sealevelpressure", 
+                  "windspeed", "cloudcover", "windgust",
+                  "month_sin", "month_cos", "dom_sin",
+                  "dom_cos", "dow_sin", "dow_cos")
+X_factor_cols <- setdiff(names(X), numeric_cols)
+
+# Convert all non-numeric columns to factors
+X[X_factor_cols] <- lapply(X[X_factor_cols], as.factor)
+
+new_X_factor_cols <- setdiff(names(new_X), numeric_cols)
+
+# Convert all non-numeric columns to factors - THIS WAS MODIFYING X INSTEAD OF new_X
+new_X[new_X_factor_cols] <- lapply(new_X[new_X_factor_cols], as.factor)
+
+y <- pre_2024_flights |>
+  dplyr::select(DEP_DEL15) |>
+  pull()
+
+# The rest of this code block is to take care of unseen levels in the test set (i.e. San Diego is in 2024 but not in 2022-23)
+# Choose a placeholder level that is not already in the training set
+placeholder_level <- "Unknown"  # Ensure this level is not in the training set
+
+# Function to replace unseen levels with a placeholder in both train and test data
+replace_unseen_levels <- function(data, train_levels, placeholder) {
+  data <- as.character(data)  # Convert to character to modify levels
+  data[!(data %in% train_levels)] <- placeholder  # Replace unseen levels with placeholder
+  factor(data, levels = c(train_levels, placeholder))  # Convert back to factor with the same levels as training + placeholder
+}
+
+# Apply the replacement for each factor column
+for (col in X_factor_cols) {
+  if (col %in% names(new_X) && is.factor(X[[col]])) {
+    # Get levels from training data
+    train_levels <- levels(X[[col]])
+
+    # Replace unseen levels in both training and test data
+    X[[col]] <- replace_unseen_levels(X[[col]], train_levels, placeholder_level)
+    new_X[[col]] <- replace_unseen_levels(new_X[[col]], train_levels, placeholder_level)
+  }
+}
+
+# Train the random forest model on the modified training data
+rf <- randomForest(X, y = factor(y), 
+                   mtry = 7, classwt = c(1, 5))
+```
+
+``` {r}
+# Hyperparameter tuning
+# create tunegrid with 15 values from 1:15 for mtry to tunning model. Our train function will change number of entry variable at each split according to tunegrid. 
+# gs_train <- train_pre_2024 %>%
+#   # Remove variables that are the same for all rows
+#   dplyr::select(-ORIGIN, -ORIGIN_AIRPORT_ID, -ORIGIN_AIRPORT_SEQ_ID, 
+#          -ORIGIN_CITY_MARKET_ID, -ORIGIN_CITY_NAME, -ORIGIN_STATE_ABR, 
+#          -ORIGIN_STATE_FIPS, -ORIGIN_STATE_NM, -ORIGIN_WAC, -FLIGHTS) %>%
+#   # Remove date variable
+#   dplyr::select(-FL_DATE) %>%
+#   # Remove ID variables that are too granular
+#   dplyr::select(-TAIL_NUM, -OP_CARRIER_FL_NUM)
+# 
+# # Convert character columns to factors
+# char_cols <- sapply(gs_train, is.character)
+# gs_train[, char_cols] <- lapply(gs_train[, char_cols], factor)
+# 
+# # Ensure DEP_DEL15 is a factor
+# gs_train$DEP_DEL15 <- factor(gs_train$DEP_DEL15)
+# 
+# # ----------------------------------------------
+# 
+# # Define the mtry values to try
+# mtry_values <- seq(3, 15, by = 2)
+# 
+# # Initialize a dataframe to store results
+# results <- data.frame(mtry = mtry_values, 
+#                       oob_error = NA, 
+#                       accuracy = NA)
+# 
+# # Try different mtry values
+# for (i in seq_along(mtry_values)) {
+#   cat("Testing mtry =", mtry_values[i], "\n")
+#   
+#   # Train model with current mtry value
+#   rf_model <- randomForest(
+#     DEP_DEL15 ~ .,
+#     data = gs_train,
+#     mtry = mtry_values[i],
+#     ntree = 500,
+#     classwt = c(1, 5)
+#   )
+#   
+#   # Store OOB error rate
+#   results$oob_error[i] <- rf_model$err.rate[rf_model$ntree, "OOB"]
+#   
+#   # Calculate accuracy
+#   results$accuracy[i] <- 1 - results$oob_error[i]
+# }
+# 
+# # Find the best mtry
+# best_idx <- which.max(results$accuracy)
+# best_mtry <- mtry_values[best_idx]
+# cat("Best mtry:", best_mtry, "with accuracy:", results$accuracy[best_idx], "\n")
+# 
+# # Plot the results
+# p <- ggplot(results, aes(x = mtry, y = accuracy)) +
+#   geom_point() +
+#   geom_line() +
+#   geom_vline(xintercept = best_mtry, linetype = "dashed", color = "red") +
+#   labs(title = "Random Forest: Accuracy by mtry value",
+#        x = "mtry",
+#        y = "Accuracy (1 - OOB Error)") +
+#   theme_minimal()
+# print(p)
+# 
+# # Print results in a format similar to caret's output
+# cat("\nRandom Forest mtry Tuning Results:\n")
+# cat("-----------------------------------\n")
+# print(results[order(-results$accuracy),])
+```
+
+``` {r}
+rf_model_importance <- importance(rf) |>
+  as.data.frame() |>
+  arrange(desc(MeanDecreaseGini))
+rf_model_importance
+```
+
+``` {r, fig.height = 7}
+varImpPlot(rf, main = "Variable Importance Measured by Random Forest")
+```
+
+``` {r}
+rf$confusion
+```
+
+# Model Validation
+
+``` {r}
+# Check and handle unseen levels
+# for (col in names(X)) {
+#   if (is.factor(X[[col]]) && col %in% names(new_X)) {
+#     new_levels <- setdiff(levels(new_X[[col]]), levels(X[[col]]))
+#     if (length(new_levels) > 0) {
+#       # Recode unseen levels in new_X to the first level or another placeholder
+#       new_X[[col]] <- factor(new_X[[col]], levels = c(levels(X[[col]]), "Unknown"))
+#       new_X[[col]][!(new_X[[col]] %in% levels(X[[col]]))] <- "Unknown"
+#     }
+#   }
+# }
+
+# # Function to align factor levels in new data with training data
+# align_factor_levels <- function(new_data, train_data) {
+#   # Get column names that are factors in the training data
+#   factor_cols <- names(train_data)[sapply(train_data, is.factor)]
+#   
+#   # For each factor column
+#   for (col in factor_cols) {
+#     if (col %in% names(new_data)) {
+#       # Convert column to character first
+#       new_data[[col]] <- as.character(new_data[[col]])
+#       
+#       # Check for new levels not in training data
+#       train_levels <- levels(train_data[[col]])
+#       new_levels <- unique(new_data[[col]])
+#       unseen_levels <- setdiff(new_levels, train_levels)
+#       
+#       if (length(unseen_levels) > 0) {
+#         # Replace unseen levels with NA or some other strategy
+#         warning(paste("Column", col, "contains", length(unseen_levels), 
+#                      "levels not present in training data. Replacing with NA."))
+#         new_data[[col]][new_data[[col]] %in% unseen_levels] <- NA
+#       }
+#       
+#       # Convert back to factor with same levels as training data
+#       new_data[[col]] <- factor(new_data[[col]], levels = train_levels)
+#     }
+#   }
+#   
+#   return(new_data)
+# }
+# 
+# new_X_aligned <- align_factor_levels(new_X, X)
+```
+
+``` {r}
+# Now try the prediction
+predicted_probs <- predict(rf, newdata = new_X, type = "prob")[, 2]
+
+# Add predictions to your validation dataset -- need to change
+flights_2024_visible$predicted_prob <- predicted_probs
+
+# Create the histogram
+ggplot(flights_2024_visible, aes(x = predicted_probs, fill = factor(DEP_DEL15))) +
+  geom_histogram(binwidth = 0.025, position = "identity", alpha = 0.6, color = "black") +
+  scale_fill_manual(
+  values = c("0" = "lightgreen", "1" = "salmon"),
+  name = "Actual Delay",
+  na.translate = FALSE
+  )  + 
+  geom_vline(xintercept = 0.5, linetype = "dashed", color = "red", linewidth = 1) +
+  labs(
+    title = "Training Set: Predicted Probabilities by True Delay Label",
+    x = "Predicted Probability (DEP_DEL15 = 1)",
+    y = "Count of Flights"
+  ) +
+  theme_minimal()
+
+```
+
+``` {r}
+library(tidyr)
+
+# Create a sequence of thresholds to evaluate
+thresholds <- seq(0, 1, by = 0.01)
+
+# Initialize a data frame to store the metrics
+metrics <- data.frame(
+  threshold = thresholds,
+  accuracy = numeric(length(thresholds)),
+  precision = numeric(length(thresholds)),
+  recall = numeric(length(thresholds)),
+  f1 = numeric(length(thresholds))
+)
+
+actual_y <- flights_2024_visible |>
+  dplyr::select(DEP_DEL15) |>
+  pull()
+
+# Calculate metrics for each threshold
+for (i in 1:length(thresholds)) {
+  # Convert probabilities to binary predictions using current threshold
+  predictions <- ifelse(predicted_probs >= thresholds[i], 1, 0)
+  
+  # Create confusion matrix
+  cm <- table(Actual = actual_y, Predicted = predictions)
+  
+  tn <- ifelse(nrow(cm) < 2 || ncol(cm) < 2, 0, cm[1,1])
+  fp <- ifelse(nrow(cm) < 2 || ncol(cm) < 2, 0, cm[1,2])
+  fn <- ifelse(nrow(cm) < 2 || ncol(cm) < 2, 0, cm[2,1])
+  tp <- ifelse(nrow(cm) < 2 || ncol(cm) < 2, 0, cm[2,2])
+    
+  # Calculate metrics
+  metrics$accuracy[i] <- (tp + tn) / sum(cm)
+  metrics$precision[i] <- ifelse(tp + fp > 0, tp / (tp + fp), 0)
+  metrics$recall[i] <- ifelse(tp + fn > 0, tp / (tp + fn), 0)
+  metrics$f1[i] <- ifelse(metrics$precision[i] + metrics$recall[i] > 0,
+                          2 * (metrics$precision[i] * metrics$recall[i]) / 
+                            (metrics$precision[i] + metrics$recall[i]),
+                          0)
+}
+
+# Reshape the data for plotting
+metrics_long <- metrics %>%
+  pivot_longer(cols = c(accuracy, precision, recall, f1),
+               names_to = "metric",
+               values_to = "value")
+
+# Create the plot
+ggplot(metrics_long, aes(x = threshold, y = value, color = metric)) +
+  geom_line(size = 1) +
+  scale_color_manual(values = c("accuracy" = "blue", 
+                                "precision" = "red", 
+                                "recall" = "green",
+                                "f1" = "purple")) +
+  labs(
+    title = "Performance Metrics by Probability Threshold",
+    x = "Probability Threshold",
+    y = "Metric Value",
+    color = "Metric"
+  ) +
+  theme_minimal() +
+  coord_cartesian(ylim = c(0, 1)) +
+  scale_x_continuous(breaks = seq(0.5, 0.8, by = 0.05))
+
+# Find the optimal threshold for F1 score
+best_f1_idx <- which.max(metrics$f1)
+best_f1_threshold <- metrics$threshold[best_f1_idx]
+cat("Optimal threshold for F1 score:", best_f1_threshold, "\n")
+cat("F1 score at optimal threshold:", metrics$f1[best_f1_idx], "\n")
+cat("Accuracy at optimal threshold:", metrics$accuracy[best_f1_idx], "\n")
+cat("Precision at optimal threshold:", metrics$precision[best_f1_idx], "\n")
+cat("Recall at optimal threshold:", metrics$recall[best_f1_idx], "\n")
+
+# Find the optimal threshold for accuracy
+best_accuracy_idx <- which.max(metrics$accuracy)
+best_accuracy_threshold <- metrics$threshold[best_accuracy_idx]
+best_accuracy_value <- metrics$accuracy[best_accuracy_idx]
+
+# Output the results
+cat("Optimal threshold for accuracy:", best_accuracy_threshold, "\n")
+cat("Accuracy at optimal threshold:", best_accuracy_value, "\n")
+cat("F1 score at this threshold:", metrics$f1[best_accuracy_idx], "\n")
+cat("Precision at this threshold:", metrics$precision[best_accuracy_idx], "\n")
+cat("Recall at this threshold:", metrics$recall[best_accuracy_idx], "\n")
+```
+
+``` {r}
+# Calculate ROC curve
+roc_obj <- roc(flights_2024_visible$DEP_DEL15, predicted_probs)
+
+# Calculate and print AUC
+auc_value <- auc(roc_obj)
+cat("AUC:", auc_value, "\n")
+
+# Plot the ROC curve (optional)
+plot(roc_obj, main = paste("Validation ROC Curve (AUC =", round(auc_value, 3), ")"))
+```
+
+``` {r}
+delay.guesses <- flights_2024_guess$predicted_prob
+test.acc <- 0.90
+team.name <- "nothingbutnet"
+
+save(list = c("delay.guesses", "test.acc", "team.name"),
+file = "nothingbutnet462final.RData")
+```
+
+```{r}
+flights_2024_visible$predicted_class <- ifelse(flights_2024_visible$predicted_prob > 0.48, 1, 0)
+```
+
+```{r, fig.height=6, fig.width=10}
+library(dplyr)
+library(ggplot2)
+library(patchwork)  
+
+# -------------------------------
+# 0. Clean Data
+# -------------------------------
+flights_2024_visible_clean <- flights_2024_visible %>%
+  filter(!is.na(DEP_DEL15))
+
+# -------------------------------
+# 1. Compare by Airline
+# -------------------------------
+airline_perf <- flights_2024_visible_clean %>%
+  group_by(OP_UNIQUE_CARRIER) %>%
+  summarise(
+    count = n(),
+    accuracy = mean(predicted_class == DEP_DEL15),
+    precision = sum(predicted_class == 1 & DEP_DEL15 == 1) / sum(predicted_class == 1),
+    recall = sum(predicted_class == 1 & DEP_DEL15 == 1) / sum(DEP_DEL15 == 1),
+    f1 = ifelse((precision + recall) > 0, 2 * (precision * recall) / (precision + recall), 0)
+  ) %>%
+  arrange(desc(accuracy))
+
+p1 <- ggplot(airline_perf, aes(x = reorder(OP_UNIQUE_CARRIER, -accuracy), y = accuracy)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  geom_text(aes(label = scales::percent(accuracy, accuracy = 1)), hjust = -0.2, size = 4) +
+  labs(title = "Accuracy by Airline", x = "Airline", y = "Accuracy") +
+  theme_minimal() +
+  coord_flip() +
+  coord_flip(ylim = c(0.5, 1)) +
+  theme(panel.grid = element_blank())
+
+# -------------------------------
+# 2. Compare by Month
+# -------------------------------
+month_perf <- flights_2024_visible_clean %>%
+  group_by(MONTH) %>%
+  summarise(
+    count = n(),
+    accuracy = mean(predicted_class == DEP_DEL15),
+    precision = sum(predicted_class == 1 & DEP_DEL15 == 1) / sum(predicted_class == 1),
+    recall = sum(predicted_class == 1 & DEP_DEL15 == 1) / sum(DEP_DEL15 == 1),
+    f1 = ifelse((precision + recall) > 0, 2 * (precision * recall) / (precision + recall), 0)
+  ) %>%
+  arrange(MONTH)
+
+p2 <- ggplot(month_perf, aes(x = MONTH, y = accuracy)) +
+  geom_line(size = 1.2, color = "skyblue") +
+  geom_point(size = 2) +
+  geom_text(aes(label = scales::percent(accuracy, accuracy = 1)), vjust = -1.0, size = 4) +
+  scale_x_continuous(
+    breaks = 1:12,
+    labels = c("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+  ) +
+  labs(title = "Accuracy by Month", x = "Month", y = "Accuracy") +
+  theme_minimal() +
+  theme(panel.grid = element_blank())
+
+# -------------------------------
+# 3. Compare by Humidity Groups
+# -------------------------------
+humidity_levels <- c("Low (<40%)", "Medium (40-70%)", "High (>=70%)", "Unknown")
+
+flights_2024_visible_clean <- flights_2024_visible_clean %>%
+  mutate(
+    humidity_group = case_when(
+      humidity < 40 ~ "Low (<40%)",
+      humidity >= 40 & humidity < 70 ~ "Medium (40-70%)",
+      humidity >= 70 ~ "High (>=70%)",
+      TRUE ~ "Unknown"
+    ),
+    humidity_group = factor(humidity_group, levels = humidity_levels)
+  )
+
+humidity_perf <- flights_2024_visible_clean %>%
+  group_by(humidity_group) %>%
+  summarise(
+    count = n(),
+    accuracy = mean(predicted_class == DEP_DEL15),
+    precision = sum(predicted_class == 1 & DEP_DEL15 == 1) / sum(predicted_class == 1),
+    recall = sum(predicted_class == 1 & DEP_DEL15 == 1) / sum(DEP_DEL15 == 1),
+    f1 = ifelse((precision + recall) > 0, 2 * (precision * recall) / (precision + recall), 0)
+  ) %>%
+  arrange(humidity_group)
+
+p3 <- ggplot(humidity_perf %>% filter(!is.na(accuracy)), aes(x = humidity_group, y = accuracy, fill = humidity_group)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = scales::percent(accuracy, accuracy = 1)), vjust = -0.5, size = 4) +
+  scale_fill_manual(
+    values = c("Low (<40%)" = "skyblue", "Medium (40-70%)" = "blue", "High (>=70%)" = "darkblue", "Unknown" = "gray")
+  ) +
+  labs(title = "Accuracy by Humidity Group", x = "Humidity Group", y = "Accuracy") +
+  theme_minimal() +
+  theme(panel.grid = element_blank())
+
+# -------------------------------
+# Combine all three plots side-by-side
+# -------------------------------
+(p3 | p2)
+
+p1
+
+```
+```{r}
+# Confusion table
+conf_mat <- table(Predicted = flights_2024_visible$predicted_class,
+                  Actual = flights_2024_visible$DEP_DEL15)
+print(conf_mat)
+
+# Calculate components
+tn <- conf_mat[1, 1]
+fp <- conf_mat[1, 2]
+fn <- conf_mat[2, 1]
+tp <- conf_mat[2, 2]
+
+# Calculate metrics
+accuracy <- (tp + tn) / sum(conf_mat)
+precision <- ifelse((tp + fp) > 0, tp / (tp + fp), 0)
+recall <- ifelse((tp + fn) > 0, tp / (tp + fn), 0)
+f1 <- ifelse((precision + recall) > 0, 2 * (precision * recall) / (precision + recall), 0)
+
+# Print
+cat(sprintf("Accuracy: %.4f\n", accuracy))
+cat(sprintf("Precision: %.4f\n", precision))
+cat(sprintf("Recall: %.4f\n", recall))
+cat(sprintf("F1 Score: %.4f\n", f1))
+
+# Calculate ROC curve
+roc_obj <- roc(flights_2024_visible$DEP_DEL15, flights_2024_visible$predicted_prob)
+
+# Calculate AUC
+auc_value <- auc(roc_obj)
+
+# Print AUC
+cat(sprintf("AUC: %.4f\n", auc_value))
+
+# Optional: plot the ROC curve
+plot(roc_obj, main = paste("ROC Curve (AUC =", round(auc_value, 3), ")"))
+
+
+```
+
+
+
+
+
